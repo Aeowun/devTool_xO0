@@ -4,48 +4,51 @@ A lightweight, deterministic relay that uses a connected Android device as a phy
 
 ## Architecture
 ```text
-Android Studio (Gemini) <--> relay.py <--> ADB <--> Android Device (ChatGPT)
+Android Studio (Gemini) <--> relay.py <--> ADB + uiautomator2 <--> Android Device (ChatGPT)
 ```
+
+## Why this refactor
+
+The original relay relied on hard-coded screen coordinates, clipboard broadcasts, and `keyevent` sequences that break on modern Android and WebView layouts. The new implementation replaces those brittle assumptions with selector-based automation using `uiautomator2`, which is much more robust across device and browser updates.
 
 ## Prerequisites
 1. **Android Device**: Connected via USB with Debugging enabled.
 2. **Chrome for Android**: Logged into your ChatGPT account.
 3. **Python 3**: Installed on your host machine.
 4. **ADB**: Available in your PATH (usually in `AppData/Local/Android/Sdk/platform-tools`).
+5. **uiautomator2**: Installed via `python -m pip install -r requirements.txt`.
 
 ## How to Use
 
-### 1. The Automation Script (`relay.py`)
-This script handles the "Heavy Lifting" of UI interaction:
-* Force-foregrounds ChatGPT.
-* Clears the composer.
-* Injects your message via ADB.
-* Polls for completion (locally, saving tokens).
-* Extracts the response text and writes it to `from_chatgpt.txt`.
+### 1. Install dependencies
+```bash
+python -m pip install -r requirements.txt
+```
 
-### 2. Manual Command
-You can trigger a relay turn manually from your terminal:
+### 2. Run a prompt through the relay
 ```bash
 python relay.py "Your message here"
 ```
 
-### 3. Integrated Loop (Gemini Workflow)
-Ask me (Gemini) to perform an audit or task using the bridge:
-> "Gemini, audit `main.rs` and send the findings to ChatGPT via the Thin Bridge."
+This script now uses selector discovery (`resourceIdMatches`, `textContains`, `className`, etc.) instead of fixed coordinates.
 
-I will then:
-1. Write the findings to a temporary string.
-2. Execute `python relay.py [findings]`.
-3. Read `from_chatgpt.txt` to get ChatGPT's critique.
-4. Update the code based on the feedback.
+### 3. Selector discovery and debugging
+When a UI element is missing or moved, use one of the following to inspect the current hierarchy:
+```bash
+adb shell uiautomator dump /sdcard/ui.xml
+adb pull /sdcard/ui.xml .
+```
+You can also inspect elements with `uiautomatorviewer` if it is available in the Android SDK.
 
-## Token Efficiency
-| Interaction Method | Host Token Cost | Reliability |
-| :--- | :--- | :--- |
-| **Gemini Native UI** | ~20,000+ per turn | Medium |
-| **Thin Bridge (relay.py)** | **~200 per turn** | **High** |
+### 4. Fallback guidance
+If ChatGPT content remains inaccessible via `uiautomator2`, the next step is a more advanced automation layer such as Appium + Chromedriver or a small companion APK that exposes the WebView through AccessibilityService or an IME-based bridge.
+
+## Validation
+The repository includes `smoke_test.py` to exercise the selector discovery path and ensure the relay remains importable and functioning in a test harness.
+
+```bash
+python smoke_test.py
+```
 
 ## Maintenance
-If the ChatGPT UI changes (e.g., button moves), update the coordinates in `relay.py`:
-* `COMPOSER_TAP`: Where you tap to type.
-* `SEND_TAP`: The blue "Send" arrow.
+The relay keeps a set of generic selector candidates rather than a device-specific coordinate grid, so when the UI changes you update the selectors and retry instead of editing numeric tap coordinates.

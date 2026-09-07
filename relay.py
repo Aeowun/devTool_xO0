@@ -1,149 +1,237 @@
+#!/usr/bin/env python3
+"""uiautomator2-based relay proof of concept.
+
+This script replaces the fragile coordinate and clipboard-based relay flow with
+selector-driven automation against a connected Android device. It is intentionally
+kept generic so the same logic can be reused for modern Chrome/ChatGPT UIs while
+still accepting the old CLI style: `python relay.py "Tell me something"`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
 import subprocess
-import time
-import xml.etree.ElementTree as ET
 import sys
-import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable
 
-ADB_PATH = r"C:\Users\fixit\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+try:
+    import uiautomator2 as u2
+except ImportError:  # pragma: no cover - exercised by smoke tests via import guard
+    u2 = None
 
-def run_adb(args):
-    result = subprocess.run([ADB_PATH] + args, capture_output=True, text=True, encoding='utf-8')
-    return result.stdout
+DEFAULT_ADB = os.environ.get("ADB_PATH", "adb")
+DEFAULT_BROWSER_PACKAGE = "com.android.chrome"
+DEFAULT_URL = "https://chat.openai.com/"
 
-def get_xml(filename="view.xml"):
-    for _ in range(3):
-        run_adb(["shell", "uiautomator", "dump", f"/sdcard/{filename}"])
-        run_adb(["pull", f"/sdcard/{filename}", filename])
-        try:
-            return ET.parse(filename).getroot()
-        except:
-            time.sleep(1)
+
+class RelayError(RuntimeError):
+    """Raised when the device or UI cannot be reached."""
+
+
+@dataclass
+class SelectorConfig:
+    app_package: str = DEFAULT_BROWSER_PACKAGE
+    input_selectors: list[dict[str, str]] = field(
+        default_factory=lambda: [
+            {"resourceIdMatches": r".*(prompt|composer|textarea|message_input).*"},
+            {"textContains": "Ask anything"},
+            {"className": "android.widget.EditText"},
+            {"className": "android.webkit.WebView"},
+        ]
+    )
+    send_selectors: list[dict[str, str]] = field(
+        default_factory=lambda: [
+            {"resourceIdMatches": r".*(send|submit|send_button|composer_send).*"},
+            {"contentDescriptionMatches": r".*(send|submit).*"},
+            {"textContains": "Send"},
+            {"descriptionContains": "Send"},
+        ]
+    )
+    response_selectors: list[dict[str, str]] = field(
+        default_factory=lambda: [
+            {"resourceIdMatches": r".*(message|response|assistant|bubble).*"},
+            {"textContains": "Stop generating"},
+            {"className": "android.widget.TextView"},
+        ]
+    )
+    timeout_s: float = 30.0
+
+
+def run_adb(args: Iterable[str]) -> str:
+    result = subprocess.run(
+        [DEFAULT_ADB, *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0 and not result.stdout.strip():
+        raise RelayError(f"ADB command failed: {' '.join(args)}\n{output}")
+    return output.strip()
+
+
+def ensure_device(serial: str | None = None) -> None:
+    devices = run_adb(["devices"])
+    if not devices or "List of devices attached" not in devices:
+        raise RelayError("No Android device found via adb. Enable USB debugging and reconnect.")
+    if serial:
+        if serial not in devices:
+            raise RelayError(f"Device {serial!r} was not found via adb.")
+    elif "device" not in devices.lower():
+        raise RelayError("ADB is available but no device is attached in an active state.")
+
+
+def connect_device(serial: str | None = None):
+    if u2 is None:
+        raise RelayError("uiautomator2 is not installed. Run: python -m pip install -r requirements.txt")
+    device = u2.connect(serial) if serial else u2.connect()
+    try:
+        device.wait(3)
+        device.shell("echo ready")
+    except Exception as exc:  # pragma: no cover - depends on the Android device runtime
+        raise RelayError(f"Unable to connect to device: {exc}") from exc
+    return device
+
+
+def find_first_match(device: Any, selectors: Iterable[dict[str, str]], timeout_s: float = 10.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for selector in selectors:
+            try:
+                match = device(**selector)
+            except TypeError:
+                continue
+            if match and getattr(match, "exists", None):
+                try:
+                    if match.exists:
+                        return match
+                except Exception:
+                    return match
+        time.sleep(0.25)
     return None
 
-def find_element(root, attr, val):
-    if root is None: return None
-    for node in root.iter():
-        if val in node.get(attr, ""):
-            return node
-    return None
 
-def get_coords(node):
-    if node is None: return None
-    bounds = node.get("bounds", "")
-    m = re.search(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
-    if m:
-        x1, y1, x2, y2 = map(int, m.groups())
-        return (x1 + x2) // 2, (y1 + y2) // 2
-    return None
+def wait_for_text(device: Any, selectors: Iterable[dict[str, str]], timeout_s: float, label: str):
+    element = find_first_match(device, selectors, timeout_s=timeout_s)
+    if element is None:
+        raise RelayError(f"Could not locate the {label} element using selector-based discovery.")
+    return element
 
-def guaranteed_clear():
-    print("Guaranteed clearing of composer...")
-    # 1. Tap Composer
-    run_adb(["shell", "input", "tap", "540", "2100"])
-    time.sleep(0.3)
-    
-    # 2. Triple Attempt: Select All + Delete
-    for _ in range(3):
-        # Move cursor to end to ensure field has hard focus
-        run_adb(["shell", "input", "keyevent", "123"]) # KEYCODE_MOVE_END
-        time.sleep(0.1)
-        # Select All (Ctrl+A)
-        run_adb(["shell", "input", "keyevent", "--metaState", "4096", "29"])
-        time.sleep(0.1)
-        # Backspace
-        run_adb(["shell", "input", "keyevent", "67"])
-        time.sleep(0.2)
-    
-    # 3. Final verification - if still not empty, spam 50 backspaces
-    root = get_xml("verify_clear.xml")
-    node = find_element(root, "resource-id", "prompt-textarea")
-    if node and node.get("text", "") not in ["", "Ask anything"]:
-        print("Selection clear failed. Spamming backspaces...")
-        for _ in range(50):
-            run_adb(["shell", "input", "keyevent", "67"])
-    
-    # 4. Hide keyboard
-    run_adb(["shell", "input", "keyevent", "KEYCODE_BACK"])
-    time.sleep(0.3)
 
-def send_message(text):
-    print("--- Sending Prompt ---")
-    run_adb(["shell", "am", "start", "-n", "com.android.chrome/com.google.android.apps.chrome.Main"])
+def open_chatgpt(device: Any, url: str = DEFAULT_URL) -> None:
+    try:
+        device.app_start(DEFAULT_BROWSER_PACKAGE)
+    except Exception:
+        pass
     time.sleep(1)
-    
-    # Ensure fresh start
-    guaranteed_clear()
-    
-    # 1. Put prompt in clipboard
-    run_adb(["shell", "am", "broadcast", "-a", "ch.pete.adbclipboard.WRITE", "--es", "text", text])
-    time.sleep(0.3)
-    
-    # 2. Focus & Paste
-    run_adb(["shell", "input", "tap", "540", "2100"])
-    time.sleep(0.3)
-    run_adb(["shell", "input", "keyevent", "279"]) # Paste
-    time.sleep(0.3)
-    
-    # 3. Send (Coordinates from latest UI check)
-    run_adb(["shell", "input", "tap", "950", "2060"])
-    print("Sent.")
-    time.sleep(0.5)
-    run_adb(["shell", "input", "keyevent", "KEYCODE_BACK"]) # Hide keyboard
-    return True
+    if url:
+        try:
+            device.shell(f"am start -a android.intent.action.VIEW -d {url}")
+        except Exception:
+            pass
+    time.sleep(2)
 
-def wait_for_gpt():
-    print("Waiting for response...", end="", flush=True)
-    time.sleep(4) # Minimum generation time
-    for _ in range(40):
-        root = get_xml("s.xml")
-        if root is None: continue
-        xml_str = ET.tostring(root, encoding='unicode')
-        if "Stop generating" not in xml_str and "Stop message" not in xml_str:
-            print(" Done.")
-            return True
-        print(".", end="", flush=True)
-        time.sleep(2)
-    return False
 
-def extract_response():
-    print("--- Extracting via Composer Scrape ---")
-    # 1. Scroll to end
-    run_adb(["shell", "input", "swipe", "500", "1800", "500", "400", "400"])
-    time.sleep(0.5)
-    
-    # 2. Tap Copy (Coordinates from bubble)
-    run_adb(["shell", "input", "tap", "75", "1150"])
-    time.sleep(1.0)
-    
-    # 3. Paste into Composer
-    run_adb(["shell", "input", "tap", "540", "2100"])
-    time.sleep(0.5)
-    run_adb(["shell", "input", "keyevent", "279"]) # Paste
-    time.sleep(2.0) # Critical: wait for XML sync
-    
-    # 4. Scrape
-    root = get_xml("scratch.xml")
-    result = "Error: Scrape failed."
-    for node in root.iter():
-        if "EditText" in node.get("class", "") or "prompt-textarea" in node.get("resource-id", ""):
-            txt = node.get("text", "")
-            if txt and txt != "Ask anything":
-                result = txt
-                break
-    
-    # 5. CLEAR COMPOSER (Mandatory clean state for next turn)
-    guaranteed_clear()
-    return result
+def activate_input(device: Any, selectors: SelectorConfig) -> Any:
+    element = wait_for_text(device, selectors.input_selectors, selectors.timeout_s, "input")
+    try:
+        element.click()
+    except Exception:
+        pass
+    return element
+
+
+def send_message(device: Any, prompt: str, selectors: SelectorConfig) -> str:
+    input_element = activate_input(device, selectors)
+    try:
+        if hasattr(input_element, "clear_text"):
+            input_element.clear_text()
+    except Exception:
+        pass
+    try:
+        input_element.set_text(prompt)
+    except Exception:
+        raise RelayError("Unable to write the prompt into the browser input field.")
+
+    send_element = wait_for_text(device, selectors.send_selectors, selectors.timeout_s, "send button")
+    try:
+        send_element.click()
+    except Exception:
+        try:
+            device.press("enter")
+        except Exception:
+            raise RelayError("The input was set, but the send control could not be activated.")
+    return prompt
+
+
+def read_response(device: Any, selectors: SelectorConfig, timeout_s: float | None = None) -> str:
+    deadline = time.monotonic() + (selectors.timeout_s if timeout_s is None else timeout_s)
+    last_text = ""
+    while time.monotonic() < deadline:
+        text_nodes = []
+        for selector in selectors.response_selectors:
+            try:
+                match = device(**selector)
+            except TypeError:
+                continue
+            if match and getattr(match, "exists", None):
+                try:
+                    if match.exists:
+                        value = getattr(match, "text", None)
+                        if callable(value):
+                            value = value()
+                        if value:
+                            text_nodes.append(str(value).strip())
+                except Exception:
+                    continue
+        if text_nodes:
+            candidate = "\n".join(filter(None, text_nodes))
+            if candidate != last_text:
+                last_text = candidate
+            if "Stop generating" not in candidate and "Generating" not in candidate and candidate:
+                return candidate
+        time.sleep(1.0)
+    if last_text:
+        return last_text
+    raise RelayError("No response was found in the ChatGPT UI after the timeout window.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Selector-based Android relay using uiautomator2.")
+    parser.add_argument("prompt", nargs="?", default="", help="Text to send to the browser assistant.")
+    parser.add_argument("--serial", default=None, help="ADB serial to target when multiple devices are connected.")
+    parser.add_argument("--url", default=DEFAULT_URL, help="URL to open in Chrome before sending the message.")
+    parser.add_argument("--timeout", type=float, default=30.0, help="Timeout used during selector discovery and response polling.")
+    parser.add_argument("--dry-run", action="store_true", help="Print the selected action without interacting with a device.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.dry_run:
+        print(f"Dry run: would use Chrome package {DEFAULT_BROWSER_PACKAGE} and URL {args.url}")
+        return 0
+
+    if not args.prompt:
+        parser.error("A prompt is required unless --dry-run is used.")
+
+    try:
+        ensure_device(args.serial)
+        device = connect_device(args.serial)
+        cfg = SelectorConfig(timeout_s=args.timeout)
+        open_chatgpt(device, args.url)
+        send_message(device, args.prompt, cfg)
+        response = read_response(device, cfg)
+        print(response)
+        return 0
+    except RelayError as exc:
+        print(f"relay.py: {exc}", file=sys.stderr)
+        return 1
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2: sys.exit(1)
-    
-    cmd = sys.argv[1]
-    if cmd.lower() == "response":
-        resp = extract_response()
-        with open("from_chatgpt.txt", "w", encoding="utf-8") as f:
-            f.write(resp)
-        print("Response saved to from_chatgpt.txt")
-    else:
-        # Send a prompt
-        send_message(cmd + " p.s. sent from Gemini 3 in Android Studio!")
+    raise SystemExit(main())

@@ -1,39 +1,37 @@
 # Relay Architecture
 
 ## Overview
-The relay is a standalone Rust utility that acts as a message broker between Gemini (in Android Studio) and ChatGPT (in a browser).
+The relay is a thin automation layer that connects a user’s Android device to a remote AI assistant workflow. The current implementation uses `adb` plus `uiautomator2` to drive a browser session without the fragile coordinate-tap pattern used in the original prototype.
 
-## Component Diagram
+## Current component flow
 ```text
-             +-------------------+
-             |      Bridge       |
-             | (State, Database) |
-             +---------+---------+
-                       |
-        +--------------+--------------+
-        |                             |
-+-------v-------+             +-------v-------+
-| GeminiAdapter |             | ChatGPTAdapter|
-| (WinAPI/AS)   |             | (CDP/Browser) |
-+-------+-------+             +-------+-------+
-        |                             |
-        v                             v
- Android Studio                Browser (Chrome)
- (JCEF / UI)                   (ChatGPT Web)
+Android Studio / local toolchain
+              |
+              v
+         relay.py
+              |
+              | ADB + uiautomator2
+              v
+    Connected Android device
+              |
+              v
+      Chrome / ChatGPT WebView
 ```
 
-## Data Model (SQLite)
-* **Sessions**: `id`, `start_time`, `end_time`, `description`.
-* **Messages**: `id`, `session_id`, `turn_id`, `sender` (GEMINI/CHATGPT), `content`, `timestamp`, `status`.
+## Why this architecture
+The older prototype was tightly coupled to a specific device screen, fixed coordinates, and clipboard hacks. The new approach keeps the automation layer generic by selecting views and controls by metadata (`resourceIdMatches`, `textContains`, `className`, and similar attributes) and waiting for the expected state before continuing.
 
-## Turn Logic
-1. **Poll Gemini**: Check for new response from Gemini.
-2. **Persist**: Store message in SQLite.
-3. **Forward to ChatGPT**: Send the message to the browser.
-4. **Poll ChatGPT**: Wait for full response generation.
-5. **Persist**: Store response.
-6. **Forward to Gemini**: Inject text back into Android Studio.
-7. **Repeat**: Until max turns reached or loop detected.
+## Practical execution model
+1. **Connect**: Ensure `adb devices` shows a live Android target.
+2. **Launch**: Start Chrome and open the target ChatGPT URL.
+3. **Discover selector**: Find the input field or message composer using view metadata.
+4. **Send**: Write the prompt and trigger the send action.
+5. **Wait**: Poll the UI until the assistant finishes or the timeout expires.
+6. **Read**: Extract the newest response text from the current browser view.
+7. **Retry/fallback**: If the view tree is missing, use a deeper browser automation layer such as Appium + Chromedriver.
 
-## Duplicate Detection
-Hash message content + turn index. If a message with the same hash exists for the current turn, skip forwarding.
+## Notes on reliability
+* Avoid fixed coordinates when possible.
+* Use retried selector lookup and a bounded wait loop.
+* Treat WebView accessibility as a fallback constraint rather than a given.
+* Keep the logic isolated to the relay path so the rest of the codebase remains stable.
