@@ -1,0 +1,2 @@
+{"device": null, "event": "start", "mode": "desktop-cdp", "outcome": "started", "phase": "invocation", "request_id": "5df1c2bd9b0944b59858b317b41e17fe", "session_id": "537cbf29ccba43a09e14fe6d59d9df27", "target": {"url": "https://chatgpt.com/"}, "timestamp": "2026-09-07T20:54:29.569Z", "turn_id": null}
+{"device": null, "error": null, "event": "outcome", "outcome": "success", "phase": "invocation", "request_id": "5df1c2bd9b0944b59858b317b41e17fe", "session_id": "537cbf29ccba43a09e14fe6d59d9df27", "target": null, "timestamp": "2026-09-07T20:54:29.614Z", "turn_id": null}
