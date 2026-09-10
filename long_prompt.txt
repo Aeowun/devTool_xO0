@@ -1,0 +1,783 @@
+﻿Analyze this code and explain its purpose: from __future__ import annotations
+
+import base64
+import http.client
+import json
+import os
+import re
+import socket
+import struct
+import time
+import uuid
+import hashlib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from core.protocol import RelayError, CdpDisconnected, DEFAULT_URL
+from adb.adb_client import run_adb, choose_device
+from diagnostics.session_logger import SessionLogger
+
+class CdpClient:
+    """Small synchronous CDP websocket client using only the Python standard library."""
+
+    def __init__(self, websocket_url: str, timeout_s: float = 10.0):
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(websocket_url)
+        if parts.scheme != "ws" or not parts.hostname or not parts.path:
+            raise RelayError(f"Unsupported CDP websocket URL: {websocket_url}")
+        try:
+            self._sock = socket.create_connection(
+                (parts.hostname, parts.port or 80), timeout=max(0.1, timeout_s)
+            )
+        except OSError as exc:
+            raise CdpDisconnected(f"Unable to connect to CDP websocket: {exc}") from exc
+        self._sock.settimeout(max(0.1, timeout_s))
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request_target = parts.path + (f"?{parts.query}" if parts.query else "")
+        request = (
+            f"GET {request_target} HTTP/1.1\r\n"
+            f"Host: {parts.hostname}:{parts.port or 80}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self._sock.sendall(request.encode("ascii"))
+        header = self._read_until(b"\r\n\r\n")
+        if b" 101 " not in header.split(b"\r\n", 1)[0]:
+            self.close()
+            raise RelayError("Chrome did not accept the CDP websocket upgrade.")
+        self._next_id = 0
+        self.target_metadata: dict[str, Any] = {}
+
+    def _read_until(self, marker: bytes) -> bytes:
+        data = bytearray()
+        while marker not in data:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise CdpDisconnected("CDP disconnected during websocket handshake.")
+            data.extend(chunk)
+            if len(data) > 64 * 1024:
+                raise RelayError("CDP websocket handshake was unexpectedly large.")
+        return bytes(data)
+
+    def _send_frame(self, payload: bytes, opcode: int = 1) -> None:
+        length = len(payload)
+        first = 0x80 | (opcode & 0x0F)
+        if length < 126:
+            header = bytes((first, 0x80 | length))
+        elif length < 65536:
+            header = bytes((first, 0x80 | 126)) + struct.pack("!H", length)
+        else:
+            header = bytes((first, 0x80 | 127)) + struct.pack("!Q", length)
+        mask = os.urandom(4)
+        encoded = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        self._sock.sendall(header + mask + encoded)
+
+    def _recv_exact(self, size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = self._sock.recv(size - len(chunks))
+            if not chunk:
+                raise CdpDisconnected("CDP websocket disconnected.")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def _recv_frame(self) -> tuple[int, bytes]:
+        try:
+            first, second = self._recv_exact(2)
+            opcode = first & 0x0F
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._recv_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._recv_exact(8))[0]
+            masked = bool(second & 0x80)
+            mask = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(length)
+            if masked:
+                payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            return opcode, payload
+        except (OSError, TimeoutError, ValueError) as exc:
+            raise CdpDisconnected(f"CDP websocket read failed: {exc}") from exc
+
+    def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self._sock is None:
+            raise CdpDisconnected("CDP connection is closed.")
+        self._next_id += 1
+        call_id = self._next_id
+        try:
+            self._send_frame(
+                json.dumps({"id": call_id, "method": method, "params": params or {}}).encode()
+            )
+        except OSError as exc:
+            raise CdpDisconnected(f"CDP websocket write failed: {exc}") from exc
+        while True:
+            opcode, payload = self._recv_frame()
+            if opcode == 0x9:  # ping
+                self._send_frame(payload, opcode=0xA)
+                continue
+            if opcode == 0x8:
+                raise CdpDisconnected("Chrome closed the CDP websocket.")
+            if opcode != 0x1:
+                continue
+            try:
+                message = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RelayError("CDP returned an invalid websocket message.") from exc
+            if message.get("id") != call_id:
+                continue  # Events and unrelated replies are safe to ignore.
+            if "error" in message:
+                raise RelayError(f"CDP {method} failed: {message['error']}")
+            return message
+
+    def evaluate(self, expression: str) -> Any:
+        response = self.call(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": True,
+            },
+        )
+        result = response.get("result", {}).get("result", {})
+        if "exceptionDetails" in response.get("result", {}):
+            details = response["result"]["exceptionDetails"]
+            raise RelayError(f"JavaScript evaluation failed: {details}")
+        if result.get("subtype") == "error":
+            raise RelayError(str(result.get("description") or "JavaScript evaluation failed."))
+        return result.get("value")
+
+    def close(self) -> None:
+        sock, self._sock = getattr(self, "_sock", None), None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+@dataclass
+class CdpTransaction:
+    turn_id: str
+    prompt_hash: str
+    baseline_ids: frozenset[str]
+    baseline_texts: frozenset[str] = frozenset()
+    action_attempted: bool = False
+    request_id: str = ""
+
+_COMPOSER_JS = r"""/* relay:discover-composer */
+(() => {
+  const visible = e => { const s = getComputedStyle(e), r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none"; };
+  const nodes = [...document.querySelectorAll("textarea,[contenteditable='true'],[role='textbox']")]
+    .filter(visible).filter(e => !e.closest("nav,header,[role='navigation']"));
+  const score = e => { const a = ((e.getAttribute("aria-label")||"")+" "+
+    (e.getAttribute("placeholder")||"")+" "+(e.getAttribute("data-testid")||"")).toLowerCase();
+    return (a.includes("ask")||a.includes("message")||a.includes("prompt") ? 50 : 0) +
+      (e.tagName === "TEXTAREA" ? 10 : 0) + (e.isContentEditable ? 8 : 0); };
+  nodes.sort((a,b) => score(b)-score(a));
+  if (!nodes.length) return {found:false};
+  const e = nodes[0], value = e.tagName === "TEXTAREA" || e.tagName === "INPUT" ? e.value : e.innerText;
+  return {found:true, value:value || "", tag:e.tagName, editable:!!e.isContentEditable};
+})()"""
+
+_PAGE_STATE_JS = r"""/* relay:inspect-page-state */
+(() => {
+  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+    return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden";};
+  const overlays=[...document.querySelectorAll("[role='dialog'],[aria-modal='true'],[role='menu']")]
+    .filter(visible).map(e=>({role:e.getAttribute("role"),text:(e.innerText||"").slice(0,160)}));
+  const composer=[...document.querySelectorAll("textarea,[contenteditable='true'],[role='textbox']")]
+    .some(visible);
+  const busy=!!document.querySelector("[data-is-streaming='true'],button[aria-label*='Stop']");
+  return {url:location.href,ready:document.readyState,composer,overlays,busy,
+    viewport:{width:innerWidth,height:innerHeight,visualHeight:visualViewport?.height||innerHeight}};
+})()"""
+
+_HEAL_PAGE_JS = r"""/* relay:heal-page-state */
+(() => {
+  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+    return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden";};
+  const closeWords=/^(close|cancel|dismiss|done|got it|not now|no thanks|escape)$/i;
+  const candidates=[...document.querySelectorAll(
+    "[role='dialog'] button,[role='menu'] button,[aria-modal='true'] button,button,[role='button']")]
+    .filter(visible).filter(e=>closeWords.test((e.getAttribute("aria-label")||e.textContent||"").trim()));
+  let clicked=0;
+  for(const e of candidates.slice(0,3)){e.click();clicked++;}
+  document.activeElement?.blur();
+  document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",code:"Escape",bubbles:true}));
+  document.dispatchEvent(new KeyboardEvent("keyup",{key:"Escape",code:"Escape",bubbles:true}));
+  return {clicked};
+})()"""
+
+_SET_COMPOSER_JS = r"""/* relay:set-composer */
+(() => {
+  const wanted = __RELAY_TEXT__;
+  const visible = e => { const r=e.getBoundingClientRect(), s=getComputedStyle(e);
+    return r.width>0 && r.height>0 && s.display!=="none" && s.visibility!=="hidden"; };
+  const nodes=[...document.querySelectorAll("textarea,[contenteditable='true'],[role='textbox']")]
+    .filter(visible).filter(e=>!e.closest("nav,header,[role='navigation']"));
+  const score=e=>{const a=((e.getAttribute("aria-label")||"")+" "+
+    (e.getAttribute("placeholder")||"")+" "+(e.getAttribute("data-testid")||"")).toLowerCase();
+    return (a.includes("ask")||a.includes("message")||a.includes("prompt")?50:0)+(e.tagName==="TEXTAREA"?10:0);};
+  nodes.sort((a,b)=>score(b)-score(a)); const e=nodes[0]; if(!e) return {found:false,value:""};
+  e.focus();
+  if(e.tagName==="TEXTAREA" || e.tagName==="INPUT") {
+    e.value="";
+    const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,"value")?.set ||
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
+    if(setter) setter.call(e,wanted); else e.value=wanted;
+  } else {
+    e.innerHTML="";
+    document.execCommand("selectAll",false,null);
+    document.execCommand("delete",false,null);
+    document.execCommand("insertText",false,wanted);
+    if((e.innerText||"")!==wanted) e.textContent=wanted;
+  }
+  e.dispatchEvent(new InputEvent("input",{bubbles:true,inputType:"insertText",data:wanted}));
+  e.dispatchEvent(new Event("change",{bubbles:true}));
+  const value=e.tagName==="TEXTAREA" || e.tagName==="INPUT" ? e.value : e.innerText;
+  return {found:true,value:value||""};
+})()"""
+
+_PREPARE_SEND_JS = r"""/* relay:prepare-send */
+(() => {
+  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+    return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden";};
+  const nodes=[...document.querySelectorAll("button,[role='button']")].filter(visible)
+    .filter(e=>!e.disabled && e.getAttribute("aria-disabled")!=="true");
+  const semantic=nodes.filter(e=>{const label=((e.getAttribute("aria-label")||"")+" "+
+    (e.getAttribute("title")||"")+" "+(e.textContent||"")).trim().toLowerCase();
+    const testid=(e.getAttribute("data-testid")||"").toLowerCase();
+    return (/^(send|send prompt|send message|submit)$/.test(label) ||
+      /\\b(send prompt|send message|submit)\\b/.test(label) ||
+      /(^|[-_])send([-_]|$)/.test(testid)) &&
+      !/temporary|new chat|chat mode/.test(label+" "+testid);});
+  const matches=semantic.length ? semantic : nodes.filter(e=>
+    e.tagName==="BUTTON" && e.type==="submit");
+  return {count:matches.length,labels:matches.map(e=>(e.getAttribute("aria-label")||e.textContent||"").trim())};
+})()"""
+
+_SUBMIT_JS = r"""/* relay:submit-once */
+(() => {
+  const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+    return r.width>0&&r.height>0&&s.display!=="none"&&s.visibility!=="hidden";};
+  const input=[...document.querySelectorAll("textarea,[contenteditable='true'],[role='textbox']")]
+    .filter(visible).filter(e=>!e.closest("nav,header,[role='navigation']"))
+    .sort((a,b)=>((b.getAttribute("aria-label")||"").match(/ask|message|prompt/i)?1:0)-
+      ((a.getAttribute("aria-label")||"").match(/ask|message|prompt/i)?1:0))[0];
+  const nodes=[...document.querySelectorAll("button,[role='button']")].filter(visible)
+    .filter(e=>!e.disabled && e.getAttribute("aria-disabled")!=="true");
+  const semantic=nodes.filter(e=>{const label=((e.getAttribute("aria-label")||"")+" "+
+    (e.getAttribute("title")||"")+" "+(e.textContent||"")).trim().toLowerCase();
+    const testid=(e.getAttribute("data-testid")||"").toLowerCase();
+    return (/^(send|send prompt|send message|submit)$/.test(label) ||
+      /\\b(send prompt|send message|submit)\\b/.test(label) ||
+      /(^|[-_])send([-_]|$)/.test(testid)) &&
+      !/temporary|new chat|chat mode/.test(label+" "+testid);});
+  const matches=semantic.length ? semantic : nodes.filter(e=>
+    e.tagName==="BUTTON"&&e.type==="submit");
+  if(matches.length!==1) return {clicked:false,reason:"send control not unique",count:matches.length};
+  matches[0].click(); return {clicked:true};
+})()"""
+
+_MESSAGES_JS = r"""/* relay:capture-assistant */
+(() => {
+  const roleNodes=[...document.querySelectorAll(
+    "[data-message-author-role='assistant'], [data-message-role='assistant']"
+  )];
+  const allNodes=roleNodes.length ? roleNodes : [
+    ...document.querySelectorAll("article, [class*='assistantMessage']")
+  ];
+  const nodes=allNodes.slice(-20);
+  const result=[]; const seen=new Set();
+  for(let i=0;i<nodes.length;i++) {
+    const e=nodes[i], role=e.getAttribute("data-message-author-role") ||
+      e.getAttribute("data-message-role");
+    if(role && role!=="assistant") continue; if(!e.innerText) continue;
+    const content=e.querySelector("[data-assistant-markdown], [class*='messageCopy']");
+    const text=(content ? content.innerText : e.innerText || "").trim();
+    if(!text) continue;
+    const id=e.getAttribute("data-message-id")||e.id||e.getAttribute("data-testid")||
+      ((role||"article")+":"+i); if(seen.has(id)) continue; seen.add(id);
+    const parent=e.closest("[data-is-streaming]");
+    result.push({id,text,streaming:!!parent||e.getAttribute("data-is-streaming")==="true"});
+  }
+  return result;
+})()"""
+
+def _eval_json(client: Any, script: str) -> Any:
+    value = client.evaluate(script)
+    if value is None:
+        raise RelayError("CDP returned no value for a DOM operation.")
+    return value
+
+def _composer(client: Any) -> dict[str, Any]:
+    value = _eval_json(client, _COMPOSER_JS)
+    if not isinstance(value, dict) or not value.get("found"):
+        raise RelayError("ChatGPT composer was not found in the page DOM.")
+    return value
+
+def _messages(client: Any) -> list[dict[str, Any]]:
+    value = _eval_json(client, _MESSAGES_JS)
+    return value if isinstance(value, list) else []
+
+def _set_composer(client: Any, prompt: str) -> None:
+    script = _SET_COMPOSER_JS.replace("__RELAY_TEXT__", json.dumps(prompt))
+    result = _eval_json(client, script)
+    if not isinstance(result, dict) or result.get("value") != prompt:
+        raise RelayError("Composer text did not exactly match the requested prompt.")
+
+def _page_state(client: Any) -> dict[str, Any]:
+    value = _eval_json(client, _PAGE_STATE_JS)
+    return value if isinstance(value, dict) else {}
+
+def _heal_page(client: Any) -> dict[str, Any]:
+    value = _eval_json(client, _HEAL_PAGE_JS)
+    return value if isinstance(value, dict) else {}
+
+def _submit_once(
+    client: Any,
+    prompt: str,
+    transaction: CdpTransaction,
+    stage_hook: Any = None,
+) -> None:
+    prepared = _eval_json(client, _PREPARE_SEND_JS)
+    if not isinstance(prepared, dict) or prepared.get("count") != 1:
+        raise RelayError(f"Send control was not unique: {prepared!r}")
+    if stage_hook:
+        stage_hook(
+            "send-control-discovery",
+            "verified",
+            {"labels": prepared.get("labels", []), "turn_id": transaction.turn_id},
+        )
+    transaction.action_attempted = True
+    if stage_hook:
+        stage_hook("one-shot-submission", "attempt", {"turn_id": transaction.turn_id})
+    result = _eval_json(client, _SUBMIT_JS.replace("__RELAY_TEXT__", json.dumps(prompt)))
+    if not isinstance(result, dict) or not result.get("clicked"):
+        raise RelayError(f"Send action was not verified: {result!r}")
+    if stage_hook:
+        stage_hook("one-shot-submission", "reconciled", {"sent": True, "turn_id": transaction.turn_id})
+
+def _wait_for_send_control(client: Any, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_result: Any = None
+    while time.monotonic() < deadline:
+        last_result = _eval_json(client, _PREPARE_SEND_JS)
+        if isinstance(last_result, dict) and last_result.get("count") == 1:
+            return
+        time.sleep(0.2)
+    raise RelayError(f"Send control was not unique: {last_result!r}")
+
+def _wait_for_composer(client: Any, timeout_s: float) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    checks = 0
+    while time.monotonic() < deadline:
+        try:
+            return _composer(client)
+        except CdpDisconnected:
+            raise
+        except RelayError as exc:
+            last_error = exc
+            checks += 1
+            if checks % 5 == 0:
+                _heal_page(client)
+            time.sleep(0.2)
+    raise RelayError(f"ChatGPT composer was not ready before timeout: {last_error}")
+
+def run_cdp_transaction(
+    client: Any,
+    prompt: str,
+    timeout_s: float = 45.0,
+    poll_interval_s: float = 0.4,
+    *,
+    logger: SessionLogger | None = None,
+    request_id: str | None = None,
+    device_metadata: dict[str, Any] | None = None,
+    target_metadata: dict[str, Any] | None = None,
+    stage_hook: Any = None,
+) -> tuple[str, CdpTransaction]:
+    """Perform exactly one submit and return a correlated, stable assistant turn."""
+    if not prompt:
+        raise RelayError("A non-empty prompt is required.")
+    baseline = _messages(client)
+    transaction = CdpTransaction(
+        uuid.uuid4().hex,
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        frozenset(str(item.get("id")) for item in baseline),
+        frozenset(str(item.get("text") or "").strip() for item in baseline),
+        request_id=request_id or "",
+    )
+    if logger:
+        logger.record(
+            "transaction",
+            "baseline-captured",
+            request_id=request_id,
+            turn_id=transaction.turn_id,
+            device=device_metadata,
+            target=target_metadata,
+            outcome="ready",
+            baseline_count=len(baseline),
+        )
+    try:
+        state = _page_state(client)
+        if logger:
+            logger.record(
+                "recovery",
+                "state-observed",
+                request_id=request_id,
+                turn_id=transaction.turn_id,
+                device=device_metadata,
+                target=target_metadata,
+                outcome="ready",
+                state=state,
+            )
+        if state.get("overlays"):
+            healed = _heal_page(client)
+            if logger:
+                logger.record(
+                    "recovery",
+                    "overlay-dismissed",
+                    request_id=request_id,
+                    turn_id=transaction.turn_id,
+                    device=device_metadata,
+                    target=target_metadata,
+                    outcome="attempted",
+                    overlays=len(state["overlays"]),
+                    clicked=healed.get("clicked", 0),
+                )
+        _wait_for_composer(client, min(timeout_s, 15.0))
+        if stage_hook:
+            stage_hook("input-area-discovery", "verified", {"turn_id": transaction.turn_id})
+        for insertion_attempt in range(2):
+            try:
+                _set_composer(client, prompt)
+                break
+            except RelayError:
+                if insertion_attempt == 1:
+                    raise
+                _heal_page(client)
+                _wait_for_composer(client, min(timeout_s, 5.0))
+        if stage_hook:
+            stage_hook("exact-text-insertion", "verified", {"turn_id": transaction.turn_id})
+        if logger:
+            logger.record(
+                "composer",
+                "text-verified",
+                request_id=request_id,
+                turn_id=transaction.turn_id,
+                device=device_metadata,
+                target=target_metadata,
+                outcome="ready",
+            )
+        if logger:
+            logger.record(
+                "submit",
+                "attempt",
+                request_id=request_id,
+                turn_id=transaction.turn_id,
+                device=device_metadata,
+                target=target_metadata,
+                outcome="one-shot",
+            )
+        _wait_for_send_control(client, min(timeout_s, 15.0))
+        _submit_once(client, prompt, transaction, stage_hook=stage_hook)
+        if logger:
+            logger.record(
+                "submit",
+                "verified",
+                request_id=request_id,
+                turn_id=transaction.turn_id,
+                device=device_metadata,
+                target=target_metadata,
+                outcome="accepted",
+            )
+    except CdpDisconnected as exc:
+        if transaction.action_attempted:
+            disconnect_error = CdpDisconnected(
+                "CDP disconnected after Send was attempted; refusing to submit again."
+            )
+            disconnect_error.transaction = transaction
+            raise disconnect_error from exc
+        exc.transaction = transaction
+        raise
+    except RelayError as exc:
+        exc.transaction = transaction
+        raise
+    deadline = time.monotonic() + timeout_s
+    stable_id: str | None = None
+    stable_text: str | None = None
+    stable_count = 0
+    while time.monotonic() < deadline:
+        try:
+            current = _messages(client)
+            page_state = _page_state(client)
+            is_page_busy = page_state.get("busy", False)
+        except CdpDisconnected as exc:
+            disconnect_error = CdpDisconnected(
+                "CDP disconnected while awaiting the submitted turn; refusing to retry."
+            )
+            disconnect_error.transaction = transaction
+            raise disconnect_error from exc
+        new = [
+            item for item in current
+            if (
+                str(item.get("id")) not in transaction.baseline_ids
+                or str(item.get("text") or "").strip() not in transaction.baseline_texts
+            )
+        ]
+        if new:
+            node = new[-1]
+            node_id, text = str(node.get("id")), str(node.get("text") or "").strip()
+            generating = is_page_busy or bool(node.get("streaming")) or any(
+                marker in text.lower() for marker in ("stop generating", "generating...")
+            )
+            if text and not generating and node_id == stable_id and text == stable_text:
+                stable_count += 1
+            elif text and not generating:
+                stable_id, stable_text, stable_count = node_id, text, 1
+            else:
+                stable_id, stable_text, stable_count = None, None, 0
+            if stable_count >= 5:
+                if stage_hook:
+                    stage_hook(
+                        "correlated-stable-response",
+                        "verified",
+                        {"text_length": len(stable_text or ""), "turn_id": transaction.turn_id},
+                    )
+                if logger:
+                    logger.record(
+                        "response",
+                        "stable",
+                        request_id=request_id,
+                        turn_id=transaction.turn_id,
+                        device=device_metadata,
+                        target=target_metadata,
+                        outcome="success",
+                    )
+                return stable_text or "", transaction
+        time.sleep(poll_interval_s)
+    raise RelayError(
+        "A new stable assistant response was not observed before timeout "
+        f"(turn_id={transaction.turn_id}, submit_attempted={transaction.action_attempted})."
+    )
+
+def _local_port() -> int:
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+def _json_http(
+    port: int,
+    path: str,
+    host: str = "127.0.0.1",
+    method: str = "GET",
+) -> Any:
+    try:
+        connection = http.client.HTTPConnection(host, port, timeout=2.0)
+        connection.request(method, path)
+        response = connection.getresponse()
+        body = response.read()
+        if response.status != 200:
+            raise RelayError(f"Chrome CDP endpoint returned HTTP {response.status}.")
+        return json.loads(body.decode("utf-8"))
+    except (OSError, http.client.HTTPException, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if isinstance(exc, (TimeoutError, ConnectionRefusedError, ConnectionResetError)):
+            raise RelayError(
+                "Chrome CDP endpoint is unavailable at "
+                f"http://{host}:{port}. Chrome must be fully closed and relaunched "
+                "with --remote-debugging-port=9222; an already-running Chrome "
+                "process ignores the debugging-port argument."
+            ) from exc
+        raise RelayError(f"Unable to query Chrome CDP endpoint: {exc}") from exc
+
+def discover_cdp_target(
+    port: int,
+    preferred_url: str,
+    timeout_s: float,
+    host: str = "127.0.0.1",
+) -> dict[str, Any]:
+    from urllib.parse import urlsplit
+
+    deadline = time.monotonic() + timeout_s
+    last_error = "no page target"
+    preferred_host = (urlsplit(preferred_url).hostname or "").lower()
+    while time.monotonic() < deadline:
+        try:
+            targets = _json_http(port, "/json/list", host)
+            pages = [target for target in targets if target.get("type") == "page"]
+            preferred = [
+                target for target in pages
+                if any(h in str(target.get("url", "")).lower()
+                       for h in ("chat.openai.com", "chatgpt.com"))
+                or (preferred_host and preferred_host in str(target.get("url", "")).lower())
+            ]
+            if preferred:
+                return preferred[0]
+        except RelayError as exc:
+            last_error = str(exc)
+        time.sleep(0.25)
+    raise RelayError(f"Could not discover a Chrome page through CDP ({last_error}).")
+
+def connect_cdp(
+    adb_path: str | None,
+    serial: str | None,
+    url: str,
+    timeout_s: float,
+) -> tuple[CdpClient, str, int]:
+    selected = choose_device(adb_path, serial)
+    port = _local_port()
+    run_adb(["forward", f"tcp:{port}", "localabstract:chrome_devtools_remote"], adb_path, selected)
+    try:
+        try:
+            target = discover_cdp_target(port, url, 1.5)
+        except RelayError:
+            run_adb(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url],
+                    adb_path, selected)
+            target = discover_cdp_target(port, url, min(timeout_s, 15.0))
+        from urllib.parse import urlsplit, urlunsplit
+
+        ws = urlsplit(target["webSocketDebuggerUrl"])
+        local_ws = urlunsplit(("ws", "127.0.0.1", f":{port}", ws.path, ws.query))
+        # Fixed the urlunsplit call above, let's be more precise
+        local_ws = f"ws://127.0.0.1:{port}{ws.path}"
+        if ws.query:
+             local_ws += f"?{ws.query}"
+             
+        client = CdpClient(local_ws, timeout_s=max(30.0, min(timeout_s, 120.0)))
+        client.call("Page.enable")
+        client.call("DOM.enable")
+        client.call("Runtime.enable")
+        ready_deadline = time.monotonic() + min(timeout_s, 15.0)
+        while True:
+            try:
+                ready_state = client.evaluate("document.readyState")
+                if ready_state in ("interactive", "complete"):
+                    break
+            except RelayError as exc:
+                if "default execution context" not in str(exc).lower():
+                    raise
+            if time.monotonic() >= ready_deadline:
+                raise RelayError("Chrome page did not expose a JavaScript execution context.")
+            time.sleep(0.25)
+        client.target_metadata = {
+            key: target.get(key)
+            for key in ("id", "type", "title", "url")
+            if target.get(key) is not None
+        }
+    except Exception:
+        try:
+            run_adb(["forward", "--remove", f"tcp:{port}"], adb_path, selected)
+        except RelayError:
+            pass
+        raise
+    return client, selected, port
+
+import shutil
+import subprocess
+
+def _find_chrome() -> str:
+    candidates = [
+        Path(os.environ.get("ProgramFiles", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    chrome = shutil.which("chrome") or shutil.which("chrome.exe")
+    if chrome:
+        return chrome
+    raise RelayError("Google Chrome executable was not found.")
+
+def ensure_desktop_cdp(
+    host: str,
+    port: int,
+    url: str = DEFAULT_URL,
+) -> None:
+    """Verify that a Chrome CDP endpoint is already reachable; start it if not."""
+    try:
+        _json_http(port, "/json/version", host)
+        return
+    except RelayError:
+        # If it's not reachable and it's a local host, attempt to auto-launch.
+        if host in ("127.0.0.1", "localhost"):
+            chrome_path = _find_chrome()
+            user_data_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "Relay Data")
+            cmd = [
+                chrome_path,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={user_data_dir}",
+                "--profile-directory=Default",
+                url
+            ]
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Wait for Chrome to initialize the CDP endpoint
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline:
+                    try:
+                        _json_http(port, "/json/version", host)
+                        return
+                    except RelayError:
+                        time.sleep(0.5)
+            except Exception as exc:
+                raise RelayError(f"Unable to auto-start Chrome: {exc}") from exc
+
+        raise RelayError(
+            f"Chrome CDP is not reachable at http://{host}:{port}. "
+            "Ensure you have manually started Chrome with --remote-debugging-port="
+            f"{port} and a non-standard --user-data-dir before running the relay."
+        )
+
+def connect_desktop_cdp(
+    endpoint: str,
+    url: str,
+    timeout_s: float,
+) -> tuple[CdpClient, str, None]:
+    """Connect directly to a locally debugged desktop Chrome instance."""
+    try:
+        host, port_text = endpoint.rsplit(":", 1)
+        port = int(port_text)
+    except ValueError as exc:
+        raise RelayError("Desktop CDP endpoint must be HOST:PORT.") from exc
+    ensure_desktop_cdp(host, port, url)
+    
+    target = discover_cdp_target(port, url, min(timeout_s, 15.0), host)
+    
+    from urllib.parse import urlsplit, urlunsplit
+
+    ws = urlsplit(target["webSocketDebuggerUrl"])
+    local_ws = f"ws://{host}:{port}{ws.path}"
+    if ws.query:
+        local_ws += f"?{ws.query}"
+
+    client = CdpClient(local_ws, timeout_s=max(30.0, min(timeout_s, 120.0)))
+    client.call("Page.enable")
+    client.call("DOM.enable")
+    client.call("Runtime.enable")
+    ready_deadline = time.monotonic() + min(timeout_s, 15.0)
+    while True:
+        try:
+            ready_state = client.evaluate("document.readyState")
+            if ready_state in ("interactive", "complete"):
+                break
+        except RelayError as exc:
+            if "default execution context" not in str(exc).lower():
+                raise
+        if time.monotonic() >= ready_deadline:
+            raise RelayError("Chrome page did not expose a JavaScript execution context.")
+        time.sleep(0.25)
+    client.target_metadata = {
+        key: target.get(key)
+        for key in ("id", "type", "title", "url")
+        if target.get(key) is not None
+    }
+    return client, f"desktop:{endpoint}", None
+ XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
