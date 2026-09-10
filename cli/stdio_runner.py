@@ -62,9 +62,43 @@ def run_stdio_mode(read_framed_message, write_framed_message):
             elif msg_type == "message":
                 if _stdio_client is None:
                     raise RelayError("Relay not initialized. Send type:initialize first.")
+                
+                # Emit status working immediately
+                write_framed_message({
+                    "type": "status",
+                    "id": request_id,
+                    "status": "working"
+                })
+
+                user_text = incoming_message.get("text")
+                context = incoming_message.get("context")
+                
+                # Build the final prompt with context as evidence
+                final_prompt = ""
+                if context:
+                    final_prompt += "[MAGY PROJECT CONTEXT]\n"
+                    if "workspace" in context:
+                        final_prompt += f"Workspace: {context['workspace'].get('name')}\n"
                     
-                prompt = incoming_message.get("text")
-                effective_prompts = chunk_prompt(prompt, MAX_PROMPT_LENGTH)
+                    if "editor" in context:
+                        ed = context["editor"]
+                        final_prompt += f"File: {ed.get('path')}\n"
+                        final_prompt += f"Language: {ed.get('language')}\n"
+                        
+                        if ed.get("selection"):
+                            final_prompt += "\n--- BEGIN SELECTION ---\n"
+                            final_prompt += ed["selection"]
+                            final_prompt += "\n--- END SELECTION ---\n"
+                        elif ed.get("content"):
+                            final_prompt += "\n--- BEGIN FILE CONTENT ---\n"
+                            final_prompt += ed["content"]
+                            final_prompt += "\n--- END FILE CONTENT ---\n"
+                    
+                    final_prompt += "\n[MAGY USER REQUEST]\n"
+                
+                final_prompt += user_text
+
+                effective_prompts = chunk_prompt(final_prompt, MAX_PROMPT_LENGTH)
                 
                 last_response = ""
                 for p in effective_prompts:
@@ -76,7 +110,6 @@ def run_stdio_mode(read_framed_message, write_framed_message):
                     "id": request_id,
                     "text": last_response
                 })
-                
                 write_framed_message({"type": "response_end", "id": request_id})
 
         except RelayError as e:
